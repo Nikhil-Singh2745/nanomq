@@ -29,12 +29,12 @@ NanoMQ is a lock-free SPSC/MPSC ring buffer over POSIX shared memory (`shm_open`
 ## Architecture
 
 ```
-Producer Process                    Consumer Process
-┌──────────────┐                   ┌──────────────┐
-│  try_push()  │                   │  try_pop()   │
-│      │       │                   │      ▲       │
-│      ▼       │                   │      │       │
-│  ┌────────┐  │   /dev/shm        │  ┌────────┐  │
+Producer Process                  Consumer Process
+┌──────────────┐                  ┌──────────────┐
+│  try_push()  │                  │  try_pop()   │
+│      │       │                  │      ▲       │
+│      ▼       │                  │      │       │
+│  ┌────────┐  │   /dev/shm       │  ┌────────┐  │
 │  │  head  │──┼──►┌──────────┐◄──┼──│  tail  │  │
 │  └────────┘  │   │ Slot [0] │   │  └────────┘  │
 │  (cacheline) │   │ Slot [1] │   │  (cacheline) │
