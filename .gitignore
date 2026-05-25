@@ -1,0 +1,37 @@
+# Build artifacts
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+cmake_install.cmake
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cache/
+compile_commands.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmark output
+*.csv
+*.dat
+results/
+
+#My own reference files (will stay here, dont change)
+PLAN.md
+BLOG.md
+
+#Debug help with LLMs
+.antigravitycli
+.claude
