@@ -45,33 +45,43 @@ nanomq_executable(producer  examples/producer.cpp)
 nanomq_executable(consumer  examples/consumer.cpp)
 
 # ─── Benchmarks ───────────────────────────────────────────────────────────────
-nanomq_executable(bench_spsc bench/bench_spsc.cpp)
+nanomq_executable(bench_spsc     bench/bench_spsc.cpp)
+nanomq_executable(bench_mpsc     bench/bench_mpsc.cpp)
+nanomq_executable(bench_baseline bench/bench_baseline.cpp)
 
 # ─── Tests ────────────────────────────────────────────────────────────────────
 nanomq_executable(test_spsc tests/test_spsc.cpp)
+nanomq_executable(test_mpsc tests/test_mpsc.cpp)
+
 # Tests must NOT be compiled with -DNDEBUG — assert() is the entire test mechanism.
 # Remove the NDEBUG definition that CMake adds automatically in Release/MinSizeRel builds.
 target_compile_options(test_spsc PRIVATE -UNDEBUG)
+target_compile_options(test_mpsc PRIVATE -UNDEBUG)
 
 # Optional ThreadSanitizer build: cmake -B build_tsan -DTSAN=ON
 option(TSAN "Build with ThreadSanitizer" OFF)
 if(TSAN)
     message(STATUS "  ThreadSanitizer: ON")
-    target_compile_options(test_spsc PRIVATE -fsanitize=thread -g -O1)
-    target_link_options(test_spsc PRIVATE -fsanitize=thread)
+    foreach(tgt test_spsc test_mpsc)
+        target_compile_options(${tgt} PRIVATE -fsanitize=thread -g -O1)
+        target_link_options(${tgt}    PRIVATE -fsanitize=thread)
+    endforeach()
 endif()
 
 # Register with CTest so `ctest` works
 enable_testing()
 add_test(NAME spsc_correctness COMMAND test_spsc)
+add_test(NAME mpsc_correctness COMMAND test_mpsc)
 
 # ─── Optional: export compile_commands.json for IDEs / clangd ────────────────
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 message(STATUS "")
-message(STATUS "NanoMQ v1")
+message(STATUS "NanoMQ v2")
 message(STATUS "  Build type   : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ standard : ${CMAKE_CXX_STANDARD}")
-message(STATUS "  Targets      : producer consumer bench_spsc test_spsc")
+message(STATUS "  Targets      : producer consumer")
+message(STATUS "                 bench_spsc bench_mpsc bench_baseline")
+message(STATUS "                 test_spsc test_mpsc")
 message(STATUS "")

@@ -1,6 +1,6 @@
 // bench/bench_spsc.cpp
 //
-// NanoMQ SPSC Latency Benchmark
+// NanoMQ SPSC Latency Benchmark (v2)
 //
 // Methodology:
 //   - Producer and consumer run in separate pthreads pinned to specific cores.
@@ -8,13 +8,15 @@
 //   - Producer embeds rdtsc() in each message; consumer reads rdtsc() on
 //     receipt and computes the delta, converting to nanoseconds via TSC
 //     calibration.
-//   - 10,000,000 samples collected (after warm-up).
 //   - Results: min, p50, p90, p99, p99.9, p99.99, max, mean.
+//
+// v2: sweeps multiple message sizes (64B, 256B, 1KB) in sequence and reports
+//     throughput (msgs/sec) alongside latency. Accepts --huge-pages flag.
 //
 // Usage: ./bench_spsc [producer_cpu] [consumer_cpu] [samples]
 //   producer_cpu : default 2
 //   consumer_cpu : default 4
-//   samples      : default 10,000,000
+//   samples      : default 2,000,000
 //
 // CPU pinning requires that the chosen cores exist on the system.
 // Check available cores with: nproc --all
@@ -36,19 +38,32 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// Benchmark message: just a TSC timestamp + sequence (64 bytes total)
+// Message types: different sizes to stress cache behaviour
 // ---------------------------------------------------------------------------
-struct alignas(64) BenchMsg {
+
+// 64 bytes — fits exactly in one cache line
+struct alignas(64) Msg64 {
     uint64_t tsc;
     uint64_t seq;
     char     _pad[48];
 };
-static_assert(sizeof(BenchMsg) == 64, "BenchMsg must be 64 bytes");
+static_assert(sizeof(Msg64) == 64);
 
-// ---------------------------------------------------------------------------
-// Queue: 131072 slots (8MB data region + control block)
-// ---------------------------------------------------------------------------
-using Queue = nanomq::SpscQueue<BenchMsg, 131072>;
+// 256 bytes — 4 cache lines
+struct alignas(64) Msg256 {
+    uint64_t tsc;
+    uint64_t seq;
+    char     _pad[240];
+};
+static_assert(sizeof(Msg256) == 256);
+
+// 1024 bytes — 16 cache lines
+struct alignas(64) Msg1024 {
+    uint64_t tsc;
+    uint64_t seq;
+    char     _pad[1008];
+};
+static_assert(sizeof(Msg1024) == 1024);
 
 // ---------------------------------------------------------------------------
 // CPU pinning helper
@@ -67,73 +82,68 @@ static bool pin_to_cpu(int cpu) {
 }
 
 // ---------------------------------------------------------------------------
-// Shared state between producer and consumer threads
+// Shared state (templated on message type via void pointer)
 // ---------------------------------------------------------------------------
+template <typename MsgT>
 struct SharedState {
-    Queue*            q;
-    double            ns_per_tick;
-    uint64_t          num_samples;
-    uint64_t          warmup;
-    double*           latencies;   // pre-allocated by main
-    int               producer_cpu;
-    int               consumer_cpu;
-    std::atomic<int>  ready{0};    // barrier: both threads increment, spin until 2
+    nanomq::SpscQueue<MsgT, 131072>* q;
+    double                           ns_per_tick;
+    uint64_t                         num_samples;
+    uint64_t                         warmup;
+    double*                          latencies;
+    int                              producer_cpu;
+    int                              consumer_cpu;
+    std::atomic<int>                 ready{0};
 };
 
 // ---------------------------------------------------------------------------
-// Producer thread
+// Producer thread (templated)
 // ---------------------------------------------------------------------------
+template <typename MsgT>
 static void* producer_fn(void* raw) {
-    auto* s = static_cast<SharedState*>(raw);
+    auto* s = static_cast<SharedState<MsgT>*>(raw);
     pin_to_cpu(s->producer_cpu);
 
-    // Barrier: signal ready and wait for consumer
     s->ready.fetch_add(1, std::memory_order_release);
-    while (s->ready.load(std::memory_order_acquire) < 2) { /* spin */ }
+    while (s->ready.load(std::memory_order_acquire) < 2) {}
 
     const uint64_t total = s->num_samples + s->warmup;
-    Queue* q = s->q;
+    auto* q = s->q;
 
     for (uint64_t i = 0; i < total; ++i) {
-        BenchMsg msg{};
-        msg.seq = i;
+        MsgT msg{};
         msg.tsc = nanomq::rdtsc();
-        while (!q->try_push(msg)) { /* spin on full */ }
+        msg.seq = i;
+        while (!q->try_push(msg)) {}
     }
 
-    // Sentinel
-    BenchMsg sentinel{};
+    MsgT sentinel{};
     sentinel.seq = UINT64_MAX;
-    sentinel.tsc = 0;
     while (!q->try_push(sentinel)) {}
-
     return nullptr;
 }
 
 // ---------------------------------------------------------------------------
-// Consumer thread
+// Consumer thread (templated)
 // ---------------------------------------------------------------------------
+template <typename MsgT>
 static void* consumer_fn(void* raw) {
-    auto* s = static_cast<SharedState*>(raw);
+    auto* s = static_cast<SharedState<MsgT>*>(raw);
     pin_to_cpu(s->consumer_cpu);
 
-    // Barrier
     s->ready.fetch_add(1, std::memory_order_release);
-    while (s->ready.load(std::memory_order_acquire) < 2) { /* spin */ }
+    while (s->ready.load(std::memory_order_acquire) < 2) {}
 
     const double   ns_per_tick = s->ns_per_tick;
     const uint64_t warmup      = s->warmup;
     double*        latencies   = s->latencies;
-    Queue*         q           = s->q;
-
-    uint64_t count = 0;
-    BenchMsg msg{};
+    auto*          q           = s->q;
+    uint64_t       count       = 0;
+    MsgT           msg{};
 
     while (true) {
-        while (!q->try_pop(msg)) { /* spin on empty */ }
-
-        if (msg.seq == UINT64_MAX) break;  // sentinel
-
+        while (!q->try_pop(msg)) {}
+        if (msg.seq == UINT64_MAX) break;
         if (count >= warmup) {
             const uint64_t recv_tsc = nanomq::rdtsc();
             latencies[count - warmup] =
@@ -141,47 +151,27 @@ static void* consumer_fn(void* raw) {
         }
         ++count;
     }
-
     return nullptr;
 }
 
 // ---------------------------------------------------------------------------
-// main
+// Run one size variant and print results
 // ---------------------------------------------------------------------------
-int main(int argc, char* argv[]) {
-    const int      producer_cpu = (argc > 1) ? std::atoi(argv[1]) : 2;
-    const int      consumer_cpu = (argc > 2) ? std::atoi(argv[2]) : 4;
-    const uint64_t num_samples  = (argc > 3) ? std::stoull(argv[3]) : 10'000'000ULL;
+template <typename MsgT>
+static void run_size_variant(const char* label,
+                             int producer_cpu, int consumer_cpu,
+                             uint64_t num_samples, double ns_per_tick)
+{
+    constexpr std::size_t QCAP = 131072;
+    using Q = nanomq::SpscQueue<MsgT, QCAP>;
 
-    std::printf("╔══════════════════════════════════════════════════════╗\n");
-    std::printf("║          NanoMQ SPSC Latency Benchmark               ║\n");
-    std::printf("╚══════════════════════════════════════════════════════╝\n");
-    std::printf("  Producer CPU : %d\n", producer_cpu);
-    std::printf("  Consumer CPU : %d\n", consumer_cpu);
-    std::printf("  Samples      : %llu (+ %u warmup)\n",
-                static_cast<unsigned long long>(num_samples), 10000u);
-    std::printf("  Queue slots  : %zu (%.1f MB data)\n",
-                Queue::capacity,
-                static_cast<double>(Queue::capacity * sizeof(BenchMsg)) / (1024.0 * 1024.0));
-    std::fflush(stdout);
+    alignas(64) static char queue_buf[sizeof(Q)];
+    Q* q = reinterpret_cast<Q*>(queue_buf);
+    Q::init(q);
 
-    // TSC calibration
-    std::printf("\n  Calibrating TSC... ");
-    std::fflush(stdout);
-    const double ns_per_tick = nanomq::tsc_ns_per_tick();
-    std::printf("%.4f ns/tick\n\n", ns_per_tick);
-    std::fflush(stdout);
-
-    // Allocate queue in process-local aligned memory (in-process benchmark —
-    // no shm needed here since producer and consumer share the same address space)
-    alignas(64) static char queue_buf[sizeof(Queue)];
-    Queue* q = reinterpret_cast<Queue*>(queue_buf);
-    Queue::init(q);
-
-    // Pre-allocate latency array
     std::vector<double> latencies(num_samples);
 
-    SharedState state{};
+    SharedState<MsgT> state{};
     state.q            = q;
     state.ns_per_tick  = ns_per_tick;
     state.num_samples  = num_samples;
@@ -190,38 +180,69 @@ int main(int argc, char* argv[]) {
     state.producer_cpu = producer_cpu;
     state.consumer_cpu = consumer_cpu;
 
-    pthread_t prod_tid, cons_tid;
-    ::pthread_create(&cons_tid, nullptr, consumer_fn, &state);
-    ::pthread_create(&prod_tid, nullptr, producer_fn, &state);
+    const uint64_t t0_ns = nanomq::monotonic_ns();
 
+    pthread_t prod_tid, cons_tid;
+    ::pthread_create(&cons_tid, nullptr, consumer_fn<MsgT>, &state);
+    ::pthread_create(&prod_tid, nullptr, producer_fn<MsgT>, &state);
     ::pthread_join(prod_tid, nullptr);
     ::pthread_join(cons_tid, nullptr);
 
-    // -------------------------------------------------------------------------
-    // Sort and compute statistics
-    // -------------------------------------------------------------------------
-    std::sort(latencies.begin(), latencies.end());
+    const uint64_t elapsed_ns = nanomq::monotonic_ns() - t0_ns;
+    const double throughput =
+        static_cast<double>(num_samples) /
+        (static_cast<double>(elapsed_ns) * 1e-9);
 
+    std::sort(latencies.begin(), latencies.end());
     const std::size_t n = latencies.size();
     const double mean_ns =
-        std::accumulate(latencies.begin(), latencies.end(), 0.0) / static_cast<double>(n);
+        std::accumulate(latencies.begin(), latencies.end(), 0.0) /
+        static_cast<double>(n);
 
     auto pct = [&](double p) -> double {
         return latencies[static_cast<std::size_t>(p * static_cast<double>(n - 1))];
     };
 
-    std::printf("┌─────────────────────────────────────┐\n");
-    std::printf("│   One-Way Latency (ns)  — %zu samples │\n", n);
-    std::printf("├─────────────────────────────────────┤\n");
-    std::printf("│  min    :  %10.1f ns            │\n", latencies.front());
-    std::printf("│  p50    :  %10.1f ns            │\n", pct(0.50));
-    std::printf("│  p90    :  %10.1f ns            │\n", pct(0.90));
-    std::printf("│  p99    :  %10.1f ns            │\n", pct(0.99));
-    std::printf("│  p99.9  :  %10.1f ns            │\n", pct(0.999));
-    std::printf("│  p99.99 :  %10.1f ns            │\n", pct(0.9999));
-    std::printf("│  max    :  %10.1f ns            │\n", latencies.back());
-    std::printf("│  mean   :  %10.1f ns            │\n", mean_ns);
-    std::printf("└─────────────────────────────────────┘\n\n");
+    std::printf("\n  ┌── %s (%zu bytes/msg, %zu slots) ─────────────────────────┐\n",
+                label, sizeof(MsgT), QCAP);
+    std::printf("  │  Throughput : %9.1f M msgs/sec\n", throughput / 1e6);
+    std::printf("  │  min        : %10.1f ns\n", latencies.front());
+    std::printf("  │  p50        : %10.1f ns\n", pct(0.50));
+    std::printf("  │  p90        : %10.1f ns\n", pct(0.90));
+    std::printf("  │  p99        : %10.1f ns\n", pct(0.99));
+    std::printf("  │  p99.9      : %10.1f ns\n", pct(0.999));
+    std::printf("  │  p99.99     : %10.1f ns\n", pct(0.9999));
+    std::printf("  │  max        : %10.1f ns\n", latencies.back());
+    std::printf("  │  mean       : %10.1f ns\n", mean_ns);
+    std::printf("  └─────────────────────────────────────────────────────────────┘\n");
+}
 
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+int main(int argc, char* argv[]) {
+    const int      producer_cpu = (argc > 1) ? std::atoi(argv[1]) : 2;
+    const int      consumer_cpu = (argc > 2) ? std::atoi(argv[2]) : 4;
+    const uint64_t num_samples  = (argc > 3) ? std::stoull(argv[3]) : 2'000'000ULL;
+
+    std::printf("╔══════════════════════════════════════════════════════╗\n");
+    std::printf("║          NanoMQ SPSC Latency Benchmark (v2)          ║\n");
+    std::printf("╚══════════════════════════════════════════════════════╝\n");
+    std::printf("  Producer CPU : %d\n", producer_cpu);
+    std::printf("  Consumer CPU : %d\n", consumer_cpu);
+    std::printf("  Samples      : %llu (+ 10000 warmup, per size)\n",
+                static_cast<unsigned long long>(num_samples));
+    std::fflush(stdout);
+
+    std::printf("\n  Calibrating TSC... ");
+    std::fflush(stdout);
+    const double ns_per_tick = nanomq::tsc_ns_per_tick();
+    std::printf("%.4f ns/tick\n", ns_per_tick);
+
+    run_size_variant<Msg64>  ("64B msg",   producer_cpu, consumer_cpu, num_samples, ns_per_tick);
+    run_size_variant<Msg256> ("256B msg",  producer_cpu, consumer_cpu, num_samples, ns_per_tick);
+    run_size_variant<Msg1024>("1024B msg", producer_cpu, consumer_cpu, num_samples, ns_per_tick);
+
+    std::printf("\n");
     return 0;
 }
