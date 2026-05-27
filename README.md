@@ -9,19 +9,19 @@ Lock-free inter-process message queue over POSIX shared memory, built from scrat
 
 ---
 
-## Key Metrics — SPSC (64-byte messages, 500K samples)
+## Key Metrics — SPSC (64-byte messages)
 
-| Metric | WSL2 (Intel i3-1315U) | Native Fedora (Ryzen 9 7900 — Isolated)† |
-|--------|----------------------|------------------------------------------|
-| min    | **130 ns**           | **7.1 ns**                               |
-| p50    | 407 ns               | **11.2 ns**                              |
-| p99    | 64,205 ns            | **24.5 ns**                              |
-| p99.9  | 112,650 ns           | **48.2 ns**                              |
-| mean   | 4,443 ns             | **12.4 ns**                              |
+| Metric | Native Fedora (Ryzen 9 7900 — Isolated)† | WSL2 (Intel i3-1315U) |
+|--------|------------------------------------------|----------------------|
+| min    | **7.1 ns**                               | 130 ns               |
+| p50    | **11.2 ns**                              | 407 ns               |
+| p99    | **24.5 ns**                              | 64,205 ns            |
+| p99.9  | **48.2 ns**                              | 112,650 ns           |
+| mean   | **12.4 ns**                              | 4,443 ns             |
 
-> **WSL2 context**: The i3-1315U numbers reflect the hypervisor scheduler preempting the busy-spinning consumer thread — a fundamental WSL2 constraint, not a queue deficiency. The **130 ns min** is the raw lock-free mechanism latency; everything above that is OS scheduling noise. On bare-metal Linux with isolated cores, the queue delivers sub-25 ns p99.
+> †*2M samples. Ryzen 9 7900, Fedora 40 native, `isolcpus=2,4`, 2MB huge pages, `-O3 -march=native`. See [Blog](https://blog-nine-phi-25.vercel.app/lab/nanomq) for full methodology.*
 >
-> †*Ryzen 9 7900 numbers measured on Fedora 40 native with `isolcpus=2,4` and 2MB huge pages. See [Blog](https://blog-nine-phi-25.vercel.app/lab/nanomq) for methodology.*
+> **WSL2 note**: The i3-1315U column (500K samples) is included for completeness — those numbers reflect the hypervisor scheduler preempting busy-spinning threads, not the queue. The 130 ns min is the raw lock-free latency; the tail latencies (64 µs p99, 112 µs p99.9) are pure OS scheduling noise. Bare metal is the only meaningful environment for latency-sensitive workloads.
 
 ---
 
