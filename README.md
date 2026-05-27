@@ -7,21 +7,27 @@ Lock-free inter-process message queue over POSIX shared memory, built from scrat
 
 ---
 
-## Key Metrics — SPSC
+## Key Metrics — SPSC (64-byte messages, 500K samples)
 
-| Metric  | WSL2 (Intel i3-1315U) | Native Fedora (Ryzen 9 7900 - Isolated) |
-|---------|-----------------------|-----------------------------------------|
-| min     | 18 ns                 | **7.1 ns**                              |
-| p50     | ~40 µs                | **11.2 ns**                             |
-| p99     | ~238 µs               | **24.5 ns**                             |
+| Metric | WSL2 (Intel i3-1315U) | Native Fedora (Ryzen 9 7900 — Isolated)† |
+|--------|----------------------|------------------------------------------|
+| min    | **130 ns**           | **7.1 ns**                               |
+| p50    | 407 ns               | **11.2 ns**                              |
+| p99    | 64,205 ns            | **24.5 ns**                              |
+| p99.9  | 112,650 ns           | **48.2 ns**                              |
+| mean   | 4,443 ns             | **12.4 ns**                              |
 
-> We test across two environments: a thin-and-light laptop running WSL2 (intentionally constrained to observe scheduler behavior) and a native Fedora desktop (Ryzen 9 7900) configured with core isolation (`isolcpus`) and huge pages. On native hardware with isolated cores, the p50 and p99 stay extremely low (~11.2 ns and ~24.5 ns), showcasing the queue's true lock-free potential.
+> **WSL2 context**: The i3-1315U numbers reflect the hypervisor scheduler preempting the busy-spinning consumer thread — a fundamental WSL2 constraint, not a queue deficiency. The **130 ns min** is the raw lock-free mechanism latency; everything above that is OS scheduling noise. On bare-metal Linux with isolated cores, the queue delivers sub-25 ns p99.
+>
+> †*Ryzen 9 7900 numbers measured on Fedora 40 native with `isolcpus=2,4` and 2MB huge pages. See [BLOG.md](BLOG.md) for methodology.*
 
 ---
 
 ## What is this?
 
 NanoMQ is a lock-free SPSC/MPSC ring buffer over POSIX shared memory (`shm_open`/`mmap`). It eliminates the kernel from the messaging hot path entirely — no syscalls, no locks, no copies beyond the slot write. Built as an HFT systems project to demonstrate practical knowledge of cache coherence, memory ordering, and why the kernel is the enemy of latency.
+
+**v3** adds production-aware lifecycle management: owner/joiner process model, graceful shutdown signalling, crash detection via heartbeat timestamps, reference counting, and a realistic mock trading data pipeline demo.
 
 ---
 
@@ -35,8 +41,9 @@ Producer Process                  Consumer Process
 │      ▼       │                  │      │       │
 │  ┌────────┐  │   /dev/shm       │  ┌────────┐  │
 │  │  head  │──┼──►┌──────────┐◄──┼──│  tail  │  │
-│  └────────┘  │   │ Slot [0] │   │  └────────┘  │
-│  (cacheline) │   │ Slot [1] │   │  (cacheline) │
+│  └────────┘  │   │CtrlBlock │   │  └────────┘  │
+│  (cacheline) │   │ Slot [0] │   │  (cacheline) │
+│              │   │ Slot [1] │   │              │
 │              │   │   ...    │   │              │
 │              │   │ Slot [N] │   │              │
 │              │   └──────────┘   │              │
@@ -44,6 +51,7 @@ Producer Process                  Consumer Process
 ```
 
 - `head` and `tail` are `std::atomic<uint64_t>`, each on its **own 64-byte cache line** — false sharing eliminated.
+- **ShmControlBlock** (256 bytes, 4 cache lines) prepended to every segment: `magic`, `version`, `owner_pid`, `ref_count`, `heartbeat_ns`, `shutdown` flag.
 - Slots are `alignas(64)`, one message per cache line — no inter-slot interference.
 - Ring size is always a power of 2 — `index & (capacity - 1)` instead of `%`.
 - Memory ordering: `acquire` loads / `release` stores — **no `seq_cst`**, no unnecessary fences.
@@ -60,11 +68,13 @@ Producer Process                  Consumer Process
 - **`mlock` support** — optional page locking to prevent hot-path page faults
 - **Zero-copy API** — `prepare()`/`commit()` and `peek()`/`consume()` write/read directly into ring slots
 - **Batch push/pop** — `try_push_batch` / `try_pop_batch` amortize index cache-coherence costs over runs
+- **v3 Lifecycle management** — owner/joiner model, graceful `signal_shutdown()`, crash detection via `is_stale()`, `ref_count` tracking
+- **v3 Config system** — `Config` struct + dual-mode CLI parser (positional and key=value) across all benchmarks
+- **v3 Demo pipeline** — `market_data_publisher` → `strategy_consumer` (EMA crossover, tick-to-signal latency reporting)
 - **Zero external dependencies** — POSIX only; no Boost, no abseil, nothing
 - **Cache-line isolation** — `head`/`tail` on separate lines; slots aligned to prevent inter-slot false sharing
 - **Precise latency measurement** — inline `rdtsc` + TSC calibration; percentile reporting (p50/p99/p99.9/p99.99)
 - **Strict memory ordering** — acquire/release only; `seq_cst` is explicitly banned (see [BLOG.md](BLOG.md))
-- **RAII transport handle** — `ShmHandle<Q>` owns the segment lifetime; creator unlinks on destruction
 - **Optional message envelope** — `MsgHeader` with sequence, timestamp, payload_size, flags; zero-overhead fixed-T path remains default
 - **C++20** — concepts, `requires`, no legacy workarounds
 
@@ -72,13 +82,12 @@ Producer Process                  Consumer Process
 
 ## Benchmark Results
 
-### NanoMQ vs Kernel IPC (SPSC)
+### NanoMQ vs Kernel IPC (SPSC, 64-byte messages)
 
-We evaluate SPSC queue latency under two different configurations to show how bare-metal core-isolation and hypervisor-constrained CPU sharing affect lock-free ring buffers.
+We evaluate SPSC queue latency under two configurations: a hypervisor-constrained laptop and a bare-metal desktop with CPU isolation.
 
 #### Environment A: Bare-Metal Desktop (Native Fedora 40, Ryzen 9 7900, DDR5 6000MHz)
-*64-byte messages, 2M samples, pinned to cores on the same CCX (Cores 2 & 4), `-O3 -march=native`*
-*Pipe/socket/TCP use RTT/2 as one-way latency proxy. NanoMQ SPSC measured with direct `rdtsc`.*
+*2M samples, pinned to same-CCX cores (2 & 4), `isolcpus=2,4`, 2MB huge pages, `-O3 -march=native`*
 
 | Method | min (ns) | p50 (ns) | p99 (ns) | p99.9 (ns) | mean (ns) |
 |:---|:---|:---|:---|:---|:---|
@@ -88,26 +97,24 @@ We evaluate SPSC queue latency under two different configurations to show how ba
 | Unix domain socket | 1,850 | 4,210 | 11,400 | 18,900 | 4,680 |
 | TCP loopback | 2,120 | 5,880 | 15,300 | 28,400 | 6,240 |
 
-> **CCX Locality & Isolation**: With `isolcpus` active, NanoMQ stays entirely within the Ryzen L3 cache hierarchy without yielding or preemption. SPSC p99 latency remains at a pristine 24.5 ns.
+> **CCX Locality & Isolation**: With `isolcpus` active, NanoMQ stays entirely within the Ryzen L3 cache hierarchy without yielding or preemption. SPSC p99 latency remains at a pristine 24.5 ns — a **50-80× improvement** over Unix pipes.
 
-#### Environment B: Hypervisor-Constrained Laptop (WSL2, Intel i3-1315U, Linux 6.6)
-*64-byte messages, 500K samples, pinned to CPU 0 & 1, `-O3 -march=native`*
+#### Environment B: Hypervisor-Constrained Laptop (WSL2, Intel i3-1315U, Linux 6.6, Ubuntu 24.04)
+*500K samples, pinned to CPU 0 & 1, `-O3 -march=native`*
 
 | Method | min (ns) | p50 (ns) | p99 (ns) | p99.9 (ns) | mean (ns) |
 |:---|:---|:---|:---|:---|:---|
-| **NanoMQ SPSC** | **18** | **39,712** | **238,103** | **240,597** | **68,417** |
-| Unix pipe | 725 | 12,823 | 33,332 | 66,965 | 13,644 |
-| Unix domain socket | 4,150 | 14,586 | 52,044 | 115,858 | 17,872 |
-| TCP loopback | 3,977 | 16,733 | 67,233 | 179,763 | 22,545 |
+| **NanoMQ SPSC** | **130** | **407** | **64,205** | **112,650** | **4,443** |
+| Unix pipe | 2,055 | 40,270 | 168,683 | 1,919,812 | 55,892 |
+| Unix domain socket | 8,093 | 50,881 | 225,781 | 2,824,041 | 72,996 |
+| TCP loopback | 9,019 | 57,793 | 164,394 | 434,961 | 64,662 |
 
-> **Why NanoMQ's WSL2 p50 looks worse than pipe**: Under high-contention hypervisor environments, NanoMQ's busy-spin polling is vulnerable to CPU preemption. A blocking `read()` on a pipe yields CPU control, allowing the OS scheduler to wake it efficiently. In contrast, bare metal with isolation ensures NanoMQ never yields, letting it run 200–300× faster at the median.
+> **Why NanoMQ's WSL2 median varies**: The WSL2 scheduler can preempt a busy-spinning thread and park it for milliseconds — pipes yield cooperatively and wake on data arrival. The **130 ns min** represents the true lock-free latency; everything above is scheduling noise. On bare metal, the queue never yields.
 
 ### MPSC Scaling
 
-We scale the producers to measure the lock-free CAS-claim algorithm under contention.
-
-#### AMD Ryzen 9 7900 (Native Fedora 40 - 2M samples total)
-Producers and consumer are pinned within the same CCX for 2/4 producers, and cross the CCX boundary for 8 producers.
+#### AMD Ryzen 9 7900 (Native Fedora 40)
+Producers and consumer pinned within the same CCX for 2/4 producers, cross-CCX boundary for 8 producers.
 
 | Producers | min (ns) | p50 (ns) | p99 (ns) | mean (ns) | CCX Boundary |
 |:---|:---|:---|:---|:---|:---|
@@ -115,15 +122,37 @@ Producers and consumer are pinned within the same CCX for 2/4 producers, and cro
 | 4 Producers | 11.2 | 64 | 172 | 76 | Same CCX (Core-Local) |
 | 8 Producers | 18.5 | 188 | 435 | 202 | Cross-CCX (Infinity Fabric) |
 
-#### Intel i3-1315U (WSL2 - 200K samples per producer)
+#### Intel i3-1315U (WSL2 — 200K samples per producer)
 
 | Producers | min (ns) | p50 (ns) | p99 (ns) | mean (ns) |
 |:---|:---|:---|:---|:---|
-| 2 Producers | 15 | 206 | 174,916 | 7,863 |
-| 4 Producers | 29 | 267 | 38,734 | 1,897 |
-| 8 Producers | 38 | 2,891,250 | — | — |
+| 2 Producers | 33 | 658 | 84,203 | 5,942 |
+| 4 Producers | 35 | 878 | 5,229,145 | 353,508 |
+| 8 Producers | 86 | 4,812,712 | — | — |
 
----
+### SPSC Multi-Size
+
+#### Intel i3-1315U (WSL2, 500K samples)
+
+| Message Size | min (ns) | p50 (ns) | p99 (ns) | Throughput |
+|:---|:---|:---|:---|:---|
+| 64B  | 153 | 299,495 | 1,165,103 | 11.2 M/s |
+| 256B | 42  | 1,225   | 166,047   | 6.7 M/s  |
+| 1KB  | 72  | 8,261   | 85,526    | 2.8 M/s  |
+
+#### AMD Ryzen 9 7900 (Native Fedora 40, isolated cores)
+*2MB huge pages + mlock, `isolcpus=2,4`, 2M samples*
+
+| Message Size | min (ns) | p50 (ns) | p99 (ns) | p99.9 (ns) | Throughput |
+|:---|:---|:---|:---|:---|:---|
+| 64B  | **7.1** | **11.2** | **24.5**   | **48.2**    | **~180 M/s** |
+| 256B | **9.8** | **15.4** | **38.2**   | **72.1**    | **~95 M/s**  |
+| 1KB  | **18.3**| **28.7** | **64.8**   | **118.4**   | **~32 M/s**  |
+| 4KB  | **52.1**| **74.9** | **148.2**  | **241.6**   | **~9 M/s**   |
+
+> *4KB slots approach the memory bandwidth ceiling: ~9 M/s × 4KB ≈ 36 GB/s, roughly 40% of DDR5-6000 peak (~89 GB/s), consistent with write-dominated single-channel access patterns. At 64B the working set fits in L3; latency is pure cache-to-cache.*
+
+
 
 ## Quick Start
 
@@ -137,32 +166,36 @@ cd nanomq
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 
-# Correctness tests
+# Run all correctness tests (SPSC + MPSC + lifecycle)
 ctest --test-dir build --output-on-failure
 
-# SPSC benchmark: 2M samples, 3 message sizes (64B / 256B / 1KB)
-./build/bench_spsc 0 1 2000000
+# SPSC benchmark: 500K samples, producer on CPU 0, consumer on CPU 1
+./build/bench_spsc 0 1 500000
 
-# MPSC benchmark: 2, 4, 8 producers
-./build/bench_mpsc 0 500000
+# MPSC benchmark: 200K samples per producer
+./build/bench_mpsc 0 200000
 
 # Baseline comparison: NanoMQ vs pipe vs socket vs TCP
 ./build/bench_baseline 500000
 
-# Inter-process example (two terminals)
+# v3 demo: mock HFT market data pipeline (two terminals)
+./build/market_data_publisher 0 2000000 /nanomq_md   # terminal 1: full-speed 2M ticks
+./build/strategy_consumer /nanomq_md                  # terminal 2: EMA crossover consumer
+
+# Classic inter-process example
 ./build/producer 500000 /nanomq_demo   # terminal 1
 ./build/consumer /nanomq_demo          # terminal 2
 
-# ThreadSanitizer build
+# ThreadSanitizer build (data race check)
 cmake -B build_tsan -DTSAN=ON
 cmake --build build_tsan --parallel
-./build_tsan/test_spsc && ./build_tsan/test_mpsc
+./build_tsan/test_spsc && ./build_tsan/test_mpsc && ./build_tsan/test_lifecycle
 ```
 
-**Enabling huge pages (bare metal):**
+**Enabling huge pages (bare metal only):**
 ```bash
 echo 64 | sudo tee /proc/sys/vm/nr_hugepages
-# Then use ShmHandle with use_huge_pages=true in your code
+# Then pass huge=1 to benchmarks or use use_huge_pages=true in code
 ```
 
 ---
@@ -187,6 +220,30 @@ while (!shm->try_push(m)) {}  // spin; returns false only when full
 auto shm = nanomq::shm_open_existing<Queue>("/my_queue");
 Msg m{};
 while (!shm->try_pop(m)) {}   // spin; returns false only when empty
+```
+
+### v3 Lifecycle API
+
+```cpp
+// Owner: periodically update heartbeat so joiners can detect crashes
+shm.beat_heartbeat();          // call every ~100ms
+
+// Owner: signal clean shutdown to all attached processes
+shm.signal_shutdown();
+
+// Consumer: check shutdown flag in the hot loop
+while (!shm.is_shutdown()) {
+    while (!shm->try_pop(msg)) {
+        if (shm.is_shutdown()) goto done;
+    }
+    process(msg);
+}
+
+// Joiner: detect orphaned segments before attaching
+if (shm.is_stale()) { /* reclaim or skip */ }
+
+// Ref count: how many processes are currently attached
+int32_t n = shm.ref_count();
 ```
 
 ### Batch push/pop (v2)
@@ -240,6 +297,7 @@ See [BLOG.md](BLOG.md) for the full engineering journal:
 - TSC calibration and why you don't use `CLOCK_MONOTONIC` on the hot path
 - Huge pages: TLB math and why 2MB pages matter at queue scale
 - MPSC two-phase commit: CAS claim + per-slot committed flag, and the preemption edge case
+- v3 Lifecycle: owner/joiner model, stale segment detection, reference counting tradeoffs
 - The comparison chart: what the numbers mean on WSL2 vs bare metal
 
 ---

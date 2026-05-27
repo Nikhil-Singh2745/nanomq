@@ -44,25 +44,31 @@ endmacro()
 nanomq_executable(producer  examples/producer.cpp)
 nanomq_executable(consumer  examples/consumer.cpp)
 
+# v3 demo: market data pipeline
+nanomq_executable(market_data_publisher  examples/market_data_publisher.cpp)
+nanomq_executable(strategy_consumer     examples/strategy_consumer.cpp)
+
 # ─── Benchmarks ───────────────────────────────────────────────────────────────
 nanomq_executable(bench_spsc     bench/bench_spsc.cpp)
 nanomq_executable(bench_mpsc     bench/bench_mpsc.cpp)
 nanomq_executable(bench_baseline bench/bench_baseline.cpp)
 
 # ─── Tests ────────────────────────────────────────────────────────────────────
-nanomq_executable(test_spsc tests/test_spsc.cpp)
-nanomq_executable(test_mpsc tests/test_mpsc.cpp)
+nanomq_executable(test_spsc      tests/test_spsc.cpp)
+nanomq_executable(test_mpsc      tests/test_mpsc.cpp)
+nanomq_executable(test_lifecycle tests/test_lifecycle.cpp)  # v3
 
 # Tests must NOT be compiled with -DNDEBUG — assert() is the entire test mechanism.
 # Remove the NDEBUG definition that CMake adds automatically in Release/MinSizeRel builds.
-target_compile_options(test_spsc PRIVATE -UNDEBUG)
-target_compile_options(test_mpsc PRIVATE -UNDEBUG)
+target_compile_options(test_spsc      PRIVATE -UNDEBUG)
+target_compile_options(test_mpsc      PRIVATE -UNDEBUG)
+target_compile_options(test_lifecycle PRIVATE -UNDEBUG)
 
 # Optional ThreadSanitizer build: cmake -B build_tsan -DTSAN=ON
 option(TSAN "Build with ThreadSanitizer" OFF)
 if(TSAN)
     message(STATUS "  ThreadSanitizer: ON")
-    foreach(tgt test_spsc test_mpsc)
+    foreach(tgt test_spsc test_mpsc test_lifecycle)
         target_compile_options(${tgt} PRIVATE -fsanitize=thread -g -O1)
         target_link_options(${tgt}    PRIVATE -fsanitize=thread)
     endforeach()
@@ -70,18 +76,20 @@ endif()
 
 # Register with CTest so `ctest` works
 enable_testing()
-add_test(NAME spsc_correctness COMMAND test_spsc)
-add_test(NAME mpsc_correctness COMMAND test_mpsc)
+add_test(NAME spsc_correctness      COMMAND test_spsc)
+add_test(NAME mpsc_correctness      COMMAND test_mpsc)
+add_test(NAME lifecycle_correctness COMMAND test_lifecycle)  # v3
 
 # ─── Optional: export compile_commands.json for IDEs / clangd ────────────────
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 message(STATUS "")
-message(STATUS "NanoMQ v2")
+message(STATUS "NanoMQ v3")
 message(STATUS "  Build type   : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ standard : ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Targets      : producer consumer")
+message(STATUS "                 market_data_publisher strategy_consumer")
 message(STATUS "                 bench_spsc bench_mpsc bench_baseline")
-message(STATUS "                 test_spsc test_mpsc")
+message(STATUS "                 test_spsc test_mpsc test_lifecycle")
 message(STATUS "")
