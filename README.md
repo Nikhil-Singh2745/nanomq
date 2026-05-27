@@ -5,6 +5,8 @@ Lock-free inter-process message queue over POSIX shared memory, built from scrat
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 
+> **📖 Read more details** about the design, engineering decisions, and methodology at [Blog](https://blog-nine-phi-25.vercel.app/lab/nanomq).
+
 ---
 
 ## Key Metrics — SPSC (64-byte messages, 500K samples)
@@ -19,7 +21,7 @@ Lock-free inter-process message queue over POSIX shared memory, built from scrat
 
 > **WSL2 context**: The i3-1315U numbers reflect the hypervisor scheduler preempting the busy-spinning consumer thread — a fundamental WSL2 constraint, not a queue deficiency. The **130 ns min** is the raw lock-free mechanism latency; everything above that is OS scheduling noise. On bare-metal Linux with isolated cores, the queue delivers sub-25 ns p99.
 >
-> †*Ryzen 9 7900 numbers measured on Fedora 40 native with `isolcpus=2,4` and 2MB huge pages. See [BLOG.md](BLOG.md) for methodology.*
+> †*Ryzen 9 7900 numbers measured on Fedora 40 native with `isolcpus=2,4` and 2MB huge pages. See [Blog](https://blog-nine-phi-25.vercel.app/lab/nanomq) for methodology.*
 
 ---
 
@@ -74,7 +76,7 @@ Producer Process                  Consumer Process
 - **Zero external dependencies** — POSIX only; no Boost, no abseil, nothing
 - **Cache-line isolation** — `head`/`tail` on separate lines; slots aligned to prevent inter-slot false sharing
 - **Precise latency measurement** — inline `rdtsc` + TSC calibration; percentile reporting (p50/p99/p99.9/p99.99)
-- **Strict memory ordering** — acquire/release only; `seq_cst` is explicitly banned (see [BLOG.md](BLOG.md))
+- **Strict memory ordering** — acquire/release only; `seq_cst` is explicitly banned (see [Blog](https://blog-nine-phi-25.vercel.app/lab/nanomq))
 - **Optional message envelope** — `MsgHeader` with sequence, timestamp, payload_size, flags; zero-overhead fixed-T path remains default
 - **C++20** — concepts, `requires`, no legacy workarounds
 
@@ -289,7 +291,7 @@ auto shm = nanomq::shm_create<MQ>("/mpsc_queue");
 
 ## Design Decisions
 
-See [BLOG.md](BLOG.md) for the full engineering journal:
+See [Blog](https://blog-nine-phi-25.vercel.app/lab/nanomq) for the full engineering journal:
 - Why power-of-2 and not `%` (latency, not aesthetics)
 - Memory ordering choices — the exact acquire/release contract and why `seq_cst` is banned
 - `shm_open` vs `memfd_create` tradeoff
